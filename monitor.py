@@ -14,12 +14,17 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from calibration import CalibrationManager, CalibrationStore
 from config import Config
 from plotting import generate_plot
+from power_controller import (
+    CompletedPowerTest,
+    PowerController,
+    parse_powerstart_args,
+)
 from power_logger import (
     PowerSessionManager,
     SessionAlreadyActiveError,
-    SessionResult,
     format_duration,
 )
+from settings import SettingsStore, parse_electricity_price
 from telegram_calibration import baseline_command as handle_baseline_command
 from ups import fmt_runtime, load_to_watts, read_ups, status_text
 
