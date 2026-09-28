@@ -1,0 +1,16 @@
+[Unit]
+Description=MYTON-3000 Workshop Power Monitor
+After=network-online.target nut-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/opt/workshop-monitor
+EnvironmentFile=/etc/workshop-monitor.env
+ExecStart=/opt/workshop-monitor/.venv/bin/python /opt/workshop-monitor/monitor.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
