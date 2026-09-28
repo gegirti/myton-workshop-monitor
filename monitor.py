@@ -11,12 +11,12 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from config import Config
+from plotting import generate_plot
 from power_logger import (
     PowerSessionManager,
     SessionAlreadyActiveError,
     SessionResult,
     format_duration,
-    generate_plot,
 )
 from ups import fmt_runtime, load_to_watts, read_ups, status_text
 

@@ -27,7 +27,7 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
-Matplotlib is used only when a completed test graph is generated. No database or web framework is required.
+Matplotlib is preferred for completed-test graphs. If it is unavailable or fails at runtime, a local Pillow fallback creates the graph using Debian's DejaVu fonts. Both paths work headlessly and do not depend on an external chart service. No database or web framework is required.
 
 ## Configuration
 
