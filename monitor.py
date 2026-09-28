@@ -6,6 +6,7 @@ import asyncio
 import html
 import logging
 import signal
+from decimal import Decimal
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -63,7 +64,34 @@ def _number(value: object, suffix: str = "", decimals: int = 0) -> str:
         return "Unknown"
 
 
-def session_summary(result: SessionResult) -> str:
+def _cost_summary(completed: CompletedPowerTest) -> str:
+    price = completed.electricity_price
+    if price is None:
+        return "Cost estimate\nNot configured; use /price <amount> <currency>"
+    stats = completed.result.statistics
+    energy_kwh = Decimal(str(stats["printer_energy_wh"] or 0)) / Decimal("1000")
+    average_kw = Decimal(str(stats["avg_printer_watts"] or 0)) / Decimal("1000")
+    cost = energy_kwh * price.amount
+    hourly_cost = average_kw * price.amount
+
+    def money(value: Decimal) -> str:
+        places = (
+            Decimal("0.0001")
+            if value != 0 and abs(value) < Decimal("0.01")
+            else Decimal("0.01")
+        )
+        return f"{value.quantize(places)} {price.currency}"
+
+    return (
+        "Cost estimate\n"
+        f"Rate: {price.amount_per_kwh} {price.currency}/kWh\n"
+        f"Job: {money(cost)}\n"
+        f"At average load: {money(hourly_cost)}/hour"
+    )
+
+
+def session_summary(completed: CompletedPowerTest) -> str:
+    result = completed.result
     stats = result.statistics
     return (
         "POWER TEST COMPLETE\n\n"
@@ -72,7 +100,8 @@ def session_summary(result: SessionResult) -> str:
         f"Start: {result.session.started_at.astimezone():%Y-%m-%d %H:%M:%S %Z}\n"
         f"Finish: {result.finished_at.astimezone():%Y-%m-%d %H:%M:%S %Z}\n"
         f"Duration: {format_duration(float(stats['duration_seconds'] or 0))}\n"
-        f"Samples: {stats['sample_count']}\n\n"
+        f"Samples: {stats['sample_count']}\n"
+        f"Stopped: {completed.stop_reason}\n\n"
         "UPS total\n"
         f"Average: {_number(stats['avg_total_watts'], ' W')}\n"
         f"Minimum: {_number(stats['min_total_watts'], ' W')}\n"
@@ -91,7 +120,8 @@ def session_summary(result: SessionResult) -> str:
         f"Start: {_number(stats['starting_battery_charge'], '%')}\n"
         f"End: {_number(stats['ending_battery_charge'], '%')}\n"
         f"Start voltage: {_number(stats['starting_battery_voltage'], ' V', 1)}\n"
-        f"End voltage: {_number(stats['ending_battery_voltage'], ' V', 1)}"
+        f"End voltage: {_number(stats['ending_battery_voltage'], ' V', 1)}\n\n"
+        f"{_cost_summary(completed)}"
     )
 
 
@@ -126,6 +156,15 @@ class WorkshopBot:
             baseline_source=baseline_source,
             failure_warning_threshold=config.nut_failure_warning_threshold,
         )
+        self.settings_store = SettingsStore(config.data_dir / "settings.json")
+        self.electricity_price = self.settings_store.load_price()
+        self.power = PowerController(
+            manager=self.manager,
+            idle_duration_seconds=config.auto_stop_idle_duration,
+            idle_uncertainty_multiplier=config.auto_stop_idle_uncertainty_multiplier,
+            activity_uncertainty_multiplier=config.auto_stop_activity_uncertainty_multiplier,
+            activity_confirm_samples=config.auto_stop_activity_confirm_samples,
+        )
         self.calibration = CalibrationManager(
             reader=self.reader,
             store=self.calibration_store,
@@ -156,22 +195,107 @@ class WorkshopBot:
     ) -> None:
         await handle_baseline_command(self, update, context)
 
+    async def help_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        del context
+        if update.effective_message is None:
+            return
+        await update.effective_message.reply_text(
+            "WORKSHOP POWER MONITOR\n\n"
+            "/ups — current UPS state\n"
+            "/baseline — run or view baseline calibration\n"
+            "/baseline status — calibration progress/current value\n"
+            "/price — show electricity price\n"
+            "/price <amount> <currency> — save price per kWh\n"
+            "/price clear — remove saved price\n"
+            "/powerstart <name> [duration] — start a test\n"
+            "/powerstatus — current test and timer state\n"
+            "/powerstop — stop manually and send results\n\n"
+            "Durations: 4h, 90m, or 2h30m. Example:\n"
+            "/powerstart hi_benchy 4h\n\n"
+            "For timed tests, the duration is a hard maximum. After printer "
+            "activity is detected above calibrated noise, five continuous "
+            "minutes back at calibrated idle ends the test early."
+        )
+
+    async def price_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if update.effective_message is None:
+            return
+        if not context.args:
+            if self.electricity_price is None:
+                await update.effective_message.reply_text(
+                    "No electricity price is configured.\n"
+                    "Use /price <amount_per_kWh> <currency>, for example "
+                    "/price 2.75 TRY"
+                )
+            else:
+                price = self.electricity_price
+                await update.effective_message.reply_text(
+                    "ELECTRICITY PRICE\n\n"
+                    f"{price.amount_per_kwh} {price.currency}/kWh\n\n"
+                    "Use /price clear to remove it."
+                )
+            return
+
+        if len(context.args) == 1 and context.args[0].lower() == "clear":
+            await asyncio.to_thread(self.settings_store.save_price, None)
+            self.electricity_price = None
+            await update.effective_message.reply_text("Electricity price cleared.")
+            return
+
+        if len(context.args) != 2:
+            await update.effective_message.reply_text(
+                "Usage: /price <amount_per_kWh> <currency>\n"
+                "Example: /price 2.75 TRY"
+            )
+            return
+        try:
+            price = parse_electricity_price(context.args[0], context.args[1])
+            await asyncio.to_thread(self.settings_store.save_price, price)
+        except (OSError, ValueError) as exc:
+            LOGGER.exception("Could not save electricity price")
+            await update.effective_message.reply_text(
+                f"Could not set electricity price: {exc}"
+            )
+            return
+        self.electricity_price = price
+        await update.effective_message.reply_text(
+            "ELECTRICITY PRICE SAVED\n\n"
+            f"{price.amount_per_kwh} {price.currency}/kWh\n"
+            "It will be included in future power-test results."
+        )
+
     async def power_start_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         if update.effective_message is None:
             return
-        name = " ".join(context.args).replace("_", " ").strip()
         if self.calibration.active is not None:
             await update.effective_message.reply_text(
                 "A baseline calibration is active. Wait for it to finish before starting a power test."
             )
             return
-        if not name:
-            await update.effective_message.reply_text("Usage: /powerstart <name>")
-            return
         try:
-            session = await self.manager.start(name)
+            name, max_duration = parse_powerstart_args(context.args)
+        except ValueError as exc:
+            await update.effective_message.reply_text(str(exc))
+            return
+
+        chat_id = update.effective_message.chat_id
+
+        async def automatic_complete(completed: CompletedPowerTest) -> None:
+            await self.send_completed_test(context.bot, chat_id, completed)
+
+        try:
+            state = await self.power.start(
+                name,
+                max_duration,
+                self.electricity_price,
+                automatic_complete,
+            )
         except SessionAlreadyActiveError as exc:
             await update.effective_message.reply_text(str(exc))
             return
@@ -179,6 +303,28 @@ class WorkshopBot:
             LOGGER.exception("Could not start power session")
             await update.effective_message.reply_text(f"Could not start power test: {exc}")
             return
+
+        session = state.session
+        timer_text = (
+            f"Maximum duration: {format_duration(max_duration)}\n"
+            if max_duration is not None
+            else "Maximum duration: none (use /powerstop)\n"
+        )
+        if state.idle_threshold_watts is not None:
+            smart_text = (
+                "Smart finish: enabled\n"
+                f"Activity threshold: >{state.activity_threshold_watts:.1f} W "
+                "printer contribution\n"
+                f"Idle threshold: ≤{state.idle_threshold_watts:.1f} W for "
+                f"{format_duration(state.idle_duration_seconds)}\n"
+            )
+        elif max_duration is not None:
+            smart_text = (
+                "Smart finish: unavailable until /baseline provides a "
+                "non-zero uncertainty; maximum timer remains active.\n"
+            )
+        else:
+            smart_text = "Smart finish: only used with a timed test.\n"
 
         await update.effective_message.reply_text(
             "POWER TEST STARTED\n\n"
@@ -189,6 +335,8 @@ class WorkshopBot:
             f"Battery voltage: {_number(session.starting_battery_voltage, ' V', 1)}\n"
             f"Baseline: {self.manager.baseline_watts:.1f} W"
             f" ± {self.manager.baseline_uncertainty_watts:.1f} W\n"
+            f"{timer_text}"
+            f"{smart_text}"
             f"Sampling every {self.config.power_sample_interval:g} seconds."
         )
 
@@ -198,7 +346,7 @@ class WorkshopBot:
         del context
         if update.effective_message is None:
             return
-        status = self.manager.status()
+        status = self.power.status()
         if status is None:
             await update.effective_message.reply_text("No power test is active.")
             return
@@ -208,11 +356,40 @@ class WorkshopBot:
                 f"Power test '{status['name']}' is active but has no samples yet."
             )
             return
+
+        remaining = status["remaining_seconds"]
+        if remaining is None:
+            timer_text = "Timer: manual stop"
+        else:
+            timer_text = f"Maximum timer remaining: {format_duration(float(remaining))}"
+
+        if status["smart_stop_enabled"]:
+            if not status["activity_detected"]:
+                smart_text = (
+                    "Smart finish: waiting for sustained printer activity "
+                    f"(>{float(status['activity_threshold_watts']):.1f} W)"
+                )
+            elif status["idle_remaining_seconds"] is not None:
+                smart_text = (
+                    "Smart finish: calibrated idle; finishes in "
+                    f"{format_duration(float(status['idle_remaining_seconds']))} "
+                    "if idle continues"
+                )
+            else:
+                smart_text = (
+                    "Smart finish: activity detected; watching for calibrated idle "
+                    f"(≤{float(status['idle_threshold_watts']):.1f} W)"
+                )
+        else:
+            smart_text = "Smart finish: not active"
+
         await update.effective_message.reply_text(
             "POWER TEST ACTIVE\n\n"
             f"{status['name']}\n"
             f"Session ID: {status['session_id']}\n"
             f"Elapsed: {format_duration(float(status['elapsed_seconds']))}\n"
+            f"{timer_text}\n"
+            f"{smart_text}\n"
             f"Load: {_number(latest.get('ups.load'), '%')}\n"
             f"UPS total: {_number(latest.get('total_watts'), ' W')}\n"
             f"Printer estimate: {_number(latest.get('printer_watts'), ' W')}\n"
@@ -221,39 +398,54 @@ class WorkshopBot:
             f"Samples: {status['sample_count']}"
         )
 
-    async def power_stop_command(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    async def send_completed_test(
+        self, telegram_bot: object, chat_id: int, completed: CompletedPowerTest
     ) -> None:
-        del context
-        if update.effective_message is None:
-            return
+        result = completed.result
         try:
-            result = await self.manager.stop()
-        except Exception as exc:
-            LOGGER.exception("Could not stop power session")
-            await update.effective_message.reply_text(f"Could not stop power test: {exc}")
-            return
-        if result is None:
-            await update.effective_message.reply_text("No power test is active.")
-            return
+            await telegram_bot.send_message(
+                chat_id=chat_id, text=session_summary(completed)
+            )
+        except Exception:
+            LOGGER.exception("Could not send completed-test summary to Telegram")
 
-        await update.effective_message.reply_text(session_summary(result))
         try:
             plot_path = await asyncio.to_thread(
                 generate_plot, result, result.baseline_watts
             )
             with plot_path.open("rb") as plot:
-                await update.effective_message.reply_photo(
-                    photo=plot, caption=f"Power graph · {result.session.name}"
+                await telegram_bot.send_photo(
+                    chat_id=chat_id,
+                    photo=plot,
+                    caption=f"Power graph · {result.session.name}",
                 )
         except Exception:
             LOGGER.exception("Could not generate or send power plot")
             try:
-                await update.effective_message.reply_text(
-                    "The test data was saved, but the graph could not be sent."
+                await telegram_bot.send_message(
+                    chat_id=chat_id,
+                    text="The test data was saved, but the graph could not be sent.",
                 )
             except Exception:
                 LOGGER.exception("Could not report plot failure to Telegram")
+
+    async def power_stop_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if update.effective_message is None:
+            return
+        try:
+            completed = await self.power.stop("manual stop")
+        except Exception as exc:
+            LOGGER.exception("Could not stop power session")
+            await update.effective_message.reply_text(f"Could not stop power test: {exc}")
+            return
+        if completed is None:
+            await update.effective_message.reply_text("No power test is active.")
+            return
+        await self.send_completed_test(
+            context.bot, update.effective_message.chat_id, completed
+        )
 
 
 async def monitor_ups(app: Application, bot: WorkshopBot) -> None:
@@ -350,6 +542,8 @@ async def main() -> None:
     config.data_dir.mkdir(parents=True, exist_ok=True)
     bot = WorkshopBot(config)
     app = Application.builder().token(config.telegram_bot_token).build()
+    app.add_handler(CommandHandler("help", bot.help_command))
+    app.add_handler(CommandHandler("price", bot.price_command))
     app.add_handler(CommandHandler("ups", bot.ups_command))
     app.add_handler(CommandHandler("powerstart", bot.power_start_command))
     app.add_handler(CommandHandler("powerstop", bot.power_stop_command))
@@ -377,7 +571,7 @@ async def main() -> None:
         await stop_event.wait()
     finally:
         await bot.calibration.shutdown()
-        await bot.manager.shutdown()
+        await bot.power.shutdown()
         if monitor_task is not None:
             monitor_task.cancel()
             try:
