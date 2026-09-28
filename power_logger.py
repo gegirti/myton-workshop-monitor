@@ -26,6 +26,9 @@ CSV_FIELDS = (
     "ups.load",
     "total_watts",
     "printer_watts",
+    "baseline_watts",
+    "baseline_uncertainty_watts",
+    "baseline_source",
     "battery.charge",
     "battery.runtime",
     "battery.voltage",
@@ -58,6 +61,9 @@ class SessionResult:
     session: PowerSession
     finished_at: datetime
     statistics: dict[str, float | int | None]
+    baseline_watts: float = 0.0
+    baseline_uncertainty_watts: float = 0.0
+    baseline_source: str = "configured fallback"
 
 
 def integrate_energy_wh(
@@ -161,6 +167,8 @@ class PowerSessionManager:
         ups_watts: float,
         baseline_watts: float,
         sample_interval: float,
+        baseline_uncertainty_watts: float = 0.0,
+        baseline_source: str = "configured fallback",
         failure_warning_threshold: int = 3,
     ) -> None:
         self._reader = reader
@@ -168,6 +176,8 @@ class PowerSessionManager:
         self.ups_watts = ups_watts
         self.baseline_watts = baseline_watts
         self.sample_interval = sample_interval
+        self.baseline_uncertainty_watts = baseline_uncertainty_watts
+        self.baseline_source = baseline_source
         self.failure_warning_threshold = failure_warning_threshold
         self._active: PowerSession | None = None
         self._lock = asyncio.Lock()
@@ -175,6 +185,15 @@ class PowerSessionManager:
     @property
     def active(self) -> PowerSession | None:
         return self._active
+
+    def set_baseline(
+        self, watts: float, uncertainty_watts: float, source: str
+    ) -> None:
+        if self._active is not None:
+            raise RuntimeError("Cannot change calibration during a power test")
+        self.baseline_watts = max(float(watts), 0.0)
+        self.baseline_uncertainty_watts = max(float(uncertainty_watts), 0.0)
+        self.baseline_source = source
 
     async def start(self, name: str) -> PowerSession:
         clean_name = " ".join(name.split()).strip()
@@ -242,6 +261,9 @@ class PowerSessionManager:
                 session.starting_battery_charge,
                 session.starting_battery_voltage,
             ),
+            baseline_watts=self.baseline_watts,
+            baseline_uncertainty_watts=self.baseline_uncertainty_watts,
+            baseline_source=self.baseline_source,
         )
 
     async def shutdown(self) -> None:
@@ -311,6 +333,9 @@ class PowerSessionManager:
             "ups.load": load,
             "total_watts": total,
             "printer_watts": printer_watts(total, self.baseline_watts),
+            "baseline_watts": self.baseline_watts,
+            "baseline_uncertainty_watts": self.baseline_uncertainty_watts,
+            "baseline_source": self.baseline_source,
             "battery.charge": optional_float(data, "battery.charge"),
             "battery.runtime": optional_float(data, "battery.runtime"),
             "battery.voltage": optional_float(data, "battery.voltage"),
@@ -339,11 +364,19 @@ def generate_plot(result: SessionResult, baseline_watts: float) -> Path:
     elapsed_minutes = [float(row["elapsed_seconds"]) / 60.0 for row in samples]
     total = [float(row["total_watts"]) for row in samples]
     printer = [float(row["printer_watts"]) for row in samples]
+    uncertainty = result.baseline_uncertainty_watts
+    printer_lower = [max(value - uncertainty, 0.0) for value in printer]
+    printer_upper = [value + uncertainty for value in printer]
     stats = result.statistics
 
     figure, axis = plt.subplots(figsize=(9, 5), dpi=140)
     axis.plot(elapsed_minutes, total, label="UPS total", linewidth=2)
     axis.plot(elapsed_minutes, printer, label="Printer estimate", linewidth=2)
+    if uncertainty > 0:
+        axis.fill_between(
+            elapsed_minutes, printer_lower, printer_upper, alpha=0.18,
+            label="Calibration uncertainty",
+        )
     peak_index = max(range(len(printer)), key=printer.__getitem__)
     axis.scatter(
         elapsed_minutes[peak_index], printer[peak_index], color="crimson", s=35, zorder=3
@@ -359,7 +392,13 @@ def generate_plot(result: SessionResult, baseline_watts: float) -> Path:
     axis.set_ylim(bottom=0)
     axis.grid(alpha=0.25)
     axis.legend()
-    figure.text(0.99, 0.01, f"Baseline: {baseline_watts:g} W", ha="right", fontsize=8)
+    figure.text(
+        0.99,
+        0.01,
+        f"Baseline: {baseline_watts:.1f} ± {uncertainty:.1f} W",
+        ha="right",
+        fontsize=8,
+    )
     figure.tight_layout(rect=(0, 0.03, 1, 1))
 
     png_path = result.session.csv_path.with_suffix(".png")

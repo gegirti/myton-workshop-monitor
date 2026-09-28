@@ -32,6 +32,8 @@ class Config:
     ups_watts: float
     baseline_watts: float
     power_sample_interval: float
+    calibration_duration: float
+    calibration_sample_interval: float
     monitor_interval: float
     nut_timeout: float
     data_dir: Path
@@ -63,6 +65,10 @@ class Config:
             baseline_watts=max(_float_env("BASELINE_WATTS", 27.0), 0.0),
             power_sample_interval=_positive_float_env(
                 "POWER_SAMPLE_INTERVAL", 5.0
+            ),
+            calibration_duration=_positive_float_env("CALIBRATION_DURATION", 300.0),
+            calibration_sample_interval=_positive_float_env(
+                "CALIBRATION_SAMPLE_INTERVAL", 5.0
             ),
             monitor_interval=_positive_float_env("UPS_MONITOR_INTERVAL", 5.0),
             nut_timeout=_positive_float_env("NUT_TIMEOUT", 5.0),

@@ -46,9 +46,12 @@ class PlottingTests(unittest.TestCase):
                 session=session,
                 finished_at=now,
                 statistics=calculate_statistics(samples, 100, 82.2),
+                baseline_watts=201,
+                baseline_uncertainty_watts=15,
+                baseline_source="test calibration",
             )
 
-            png_path = generate_pillow_plot(result, baseline_watts=27)
+            png_path = generate_pillow_plot(result, baseline_watts=201)
 
             self.assertTrue(png_path.exists())
             with Image.open(png_path) as image:

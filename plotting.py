@@ -39,6 +39,7 @@ def generate_pillow_plot(result: SessionResult, baseline_watts: float) -> Path:
         "grid": (203, 213, 225),
         "total": (37, 99, 235),
         "printer": (234, 88, 12),
+        "uncertainty": (255, 224, 194),
         "peak": (190, 24, 93),
     }
 
@@ -61,8 +62,11 @@ def generate_pillow_plot(result: SessionResult, baseline_watts: float) -> Path:
     elapsed = [float(row["elapsed_seconds"]) for row in samples]
     total = [float(row["total_watts"]) for row in samples]
     printer = [float(row["printer_watts"]) for row in samples]
+    uncertainty = result.baseline_uncertainty_watts
+    printer_lower = [max(value - uncertainty, 0.0) for value in printer]
+    printer_upper = [value + uncertainty for value in printer]
     duration_seconds = max(elapsed[-1], 1.0)
-    observed_max = max(total + printer + [1.0])
+    observed_max = max(total + printer_upper + [1.0])
     y_step = max(25.0, math.ceil(observed_max / 5.0 / 25.0) * 25.0)
     y_max = y_step * 5.0
 
@@ -104,6 +108,12 @@ def generate_pillow_plot(result: SessionResult, baseline_watts: float) -> Path:
     )
     total_points = [point(t, value) for t, value in zip(elapsed, total)]
     printer_points = [point(t, value) for t, value in zip(elapsed, printer)]
+    if uncertainty > 0 and len(samples) > 1:
+        upper_points = [point(t, value) for t, value in zip(elapsed, printer_upper)]
+        lower_points = [point(t, value) for t, value in zip(elapsed, printer_lower)]
+        draw.polygon(
+            upper_points + list(reversed(lower_points)), fill=colors["uncertainty"]
+        )
     if len(samples) == 1:
         for xy, color in (
             (total_points[0], colors["total"]),
@@ -159,7 +169,7 @@ def generate_pillow_plot(result: SessionResult, baseline_watts: float) -> Path:
     )
     draw.text(
         (width - right, legend_y),
-        f"Baseline: {baseline_watts:g} W",
+        f"Baseline: {baseline_watts:.1f} ± {uncertainty:.1f} W",
         fill=colors["muted"],
         font=small_font,
         anchor="rm",

@@ -10,6 +10,7 @@ import signal
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+from calibration import CalibrationManager, CalibrationStore
 from config import Config
 from plotting import generate_plot
 from power_logger import (
@@ -18,6 +19,7 @@ from power_logger import (
     SessionResult,
     format_duration,
 )
+from telegram_calibration import baseline_command as handle_baseline_command
 from ups import fmt_runtime, load_to_watts, read_ups, status_text
 
 LOGGER = logging.getLogger(__name__)
@@ -61,7 +63,7 @@ def _number(value: object, suffix: str = "", decimals: int = 0) -> str:
         return "Unknown"
 
 
-def session_summary(result: SessionResult, baseline_watts: float) -> str:
+def session_summary(result: SessionResult) -> str:
     stats = result.statistics
     return (
         "POWER TEST COMPLETE\n\n"
@@ -78,7 +80,9 @@ def session_summary(result: SessionResult, baseline_watts: float) -> str:
         f"Average load: {_number(stats['avg_load_percent'], '%', 1)}\n"
         f"Energy: {_number(stats['total_energy_wh'], ' Wh', 1)}\n\n"
         "Printer contribution\n"
-        f"Baseline: {baseline_watts:g} W\n"
+        f"Baseline: {result.baseline_watts:.1f} W"
+        f" ± {result.baseline_uncertainty_watts:.1f} W\n"
+        f"Calibration: {result.baseline_source}\n"
         f"Average: {_number(stats['avg_printer_watts'], ' W')}\n"
         f"Minimum: {_number(stats['min_printer_watts'], ' W')}\n"
         f"Maximum: {_number(stats['max_printer_watts'], ' W')}\n"
@@ -94,12 +98,41 @@ def session_summary(result: SessionResult, baseline_watts: float) -> str:
 class WorkshopBot:
     def __init__(self, config: Config) -> None:
         self.config = config
+        self.reader = lambda: read_ups(config.ups_name, config.nut_timeout)
+        self.calibration_store = CalibrationStore(config.data_dir / "baseline.json")
+        saved_calibration = self.calibration_store.load(config.ups_watts)
+        baseline_watts = (
+            saved_calibration.baseline_watts
+            if saved_calibration is not None
+            else config.baseline_watts
+        )
+        baseline_uncertainty = (
+            saved_calibration.uncertainty_watts
+            if saved_calibration is not None
+            else 0.0
+        )
+        baseline_source = (
+            f"calibration {saved_calibration.calibration_id}"
+            if saved_calibration is not None
+            else "configured fallback"
+        )
         self.manager = PowerSessionManager(
-            reader=lambda: read_ups(config.ups_name, config.nut_timeout),
+            reader=self.reader,
             data_dir=config.data_dir,
             ups_watts=config.ups_watts,
-            baseline_watts=config.baseline_watts,
+            baseline_watts=baseline_watts,
             sample_interval=config.power_sample_interval,
+            baseline_uncertainty_watts=baseline_uncertainty,
+            baseline_source=baseline_source,
+            failure_warning_threshold=config.nut_failure_warning_threshold,
+        )
+        self.calibration = CalibrationManager(
+            reader=self.reader,
+            store=self.calibration_store,
+            data_dir=config.data_dir,
+            ups_watts=config.ups_watts,
+            sample_interval=config.calibration_sample_interval,
+            duration=config.calibration_duration,
             failure_warning_threshold=config.nut_failure_warning_threshold,
         )
 
@@ -118,12 +151,22 @@ class WorkshopBot:
             LOGGER.exception("UPS command failed")
             await update.effective_message.reply_text(f"UPS error:\n{exc}")
 
+    async def baseline_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        await handle_baseline_command(self, update, context)
+
     async def power_start_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         if update.effective_message is None:
             return
         name = " ".join(context.args).replace("_", " ").strip()
+        if self.calibration.active is not None:
+            await update.effective_message.reply_text(
+                "A baseline calibration is active. Wait for it to finish before starting a power test."
+            )
+            return
         if not name:
             await update.effective_message.reply_text("Usage: /powerstart <name>")
             return
@@ -144,6 +187,8 @@ class WorkshopBot:
             f"UPS state: {status_text(session.starting_ups_state) or 'Unknown'}\n"
             f"Battery: {_number(session.starting_battery_charge, '%')}\n"
             f"Battery voltage: {_number(session.starting_battery_voltage, ' V', 1)}\n"
+            f"Baseline: {self.manager.baseline_watts:.1f} W"
+            f" ± {self.manager.baseline_uncertainty_watts:.1f} W\n"
             f"Sampling every {self.config.power_sample_interval:g} seconds."
         )
 
@@ -192,12 +237,10 @@ class WorkshopBot:
             await update.effective_message.reply_text("No power test is active.")
             return
 
-        await update.effective_message.reply_text(
-            session_summary(result, self.config.baseline_watts)
-        )
+        await update.effective_message.reply_text(session_summary(result))
         try:
             plot_path = await asyncio.to_thread(
-                generate_plot, result, self.config.baseline_watts
+                generate_plot, result, result.baseline_watts
             )
             with plot_path.open("rb") as plot:
                 await update.effective_message.reply_photo(
@@ -311,6 +354,8 @@ async def main() -> None:
     app.add_handler(CommandHandler("powerstart", bot.power_start_command))
     app.add_handler(CommandHandler("powerstop", bot.power_stop_command))
     app.add_handler(CommandHandler("powerstatus", bot.power_status_command))
+    app.add_handler(CommandHandler("baseline", bot.baseline_command))
+    app.add_handler(CommandHandler("calibrate", bot.baseline_command))
     app.add_error_handler(telegram_error_handler)
 
     stop_event = asyncio.Event()
@@ -331,6 +376,7 @@ async def main() -> None:
         LOGGER.info("Workshop monitor started")
         await stop_event.wait()
     finally:
+        await bot.calibration.shutdown()
         await bot.manager.shutdown()
         if monitor_task is not None:
             monitor_task.cancel()
